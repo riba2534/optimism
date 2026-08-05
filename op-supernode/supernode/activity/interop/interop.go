@@ -1023,14 +1023,10 @@ func (i *Interop) shouldResetEnginesOnRewind(timestamp uint64) (bool, error) {
 
 func (i *Interop) applyRewindPlan(plan RewindPlan) error {
 	// A plan without TargetHeads means the rewind target predates the first
-	// verifiedDB entry, so there is no verified frontier to restore the logsDBs
-	// to. Applying it would clear the verifiedDB and wipe every logsDB —
-	// including backfilled blocks from before the verification start point that
-	// can never be re-inserted, since backfill only runs on cold start. Without
-	// them, cross-validation would wrongly reject valid executing messages whose
-	// initiating messages lived in the deleted range. Halt loudly instead of
-	// silently destroying the databases; recovery requires an operator to remove
-	// the interop data directory so a fresh cold start re-runs the backfill.
+	// verifiedDB entry. Applying it would clear the verifiedDB and every logsDB,
+	// deleting backfilled pre-verification blocks that only cold-start backfill
+	// can produce — after which cross-validation would wrongly reject executing
+	// messages referencing them. Halt loudly instead of silently destroying data.
 	if plan.TargetHeads == nil {
 		first, hasFirst := i.verifiedDB.FirstTimestamp()
 		panic(fmt.Sprintf(
