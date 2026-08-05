@@ -2548,7 +2548,7 @@ func TestRewindAccepted(t *testing.T) {
 		require.Nil(t, plan.ResetAllChainsTo)
 	})
 
-	t.Run("clears logsDB when rewinding to empty", func(t *testing.T) {
+	t.Run("panics instead of clearing logsDB when rewinding to empty", func(t *testing.T) {
 		h := newInteropTestHarness(t).
 			WithChain(10, nil).
 			Build()
@@ -2569,17 +2569,25 @@ func TestRewindAccepted(t *testing.T) {
 		}
 		h.interop.logsDBs[chainID] = trackingDB
 
-		// Rewind the only entry — verifiedDB becomes empty
+		// Rewinding the only entry would empty the verifiedDB and clear the
+		// logsDBs, deleting backfilled history that cannot be regenerated.
 		plan, err := h.interop.buildRewindPlan(1000)
 		require.NoError(t, err)
-		err = h.interop.applyRewindPlan(plan)
-		require.NoError(t, err)
+		require.PanicsWithValue(t,
+			"interop: rewind at/after timestamp 1000 has no verified predecessor in the verifiedDB "+
+				"(first verified timestamp=1000, verifiedDB non-empty=true); refusing to apply it because "+
+				"that would clear the verifiedDB and all logsDBs, irrecoverably deleting backfilled "+
+				"log history needed to verify executing messages; to recover, remove the interop data "+
+				"directory and restart so cold-start backfill reseeds the databases",
+			func() { _ = h.interop.applyRewindPlan(plan) })
 
-		// logsDB should be cleared (no previous frontier to rewind to)
-		require.True(t, trackingDB.clearCalled > 0, "logsDB should be cleared when rewinding to empty")
+		// Nothing was deleted: logsDB untouched, verifiedDB entry preserved.
+		require.Equal(t, 0, trackingDB.clearCalled, "logsDB must not be cleared")
+		has, _ := h.interop.verifiedDB.Has(1000)
+		require.True(t, has, "verifiedDB entry must be preserved")
 	})
 
-	t.Run("full rewind captures reset payloads before clearing verified frontier", func(t *testing.T) {
+	t.Run("full rewind captures reset payloads but panics before clearing", func(t *testing.T) {
 		h := newInteropTestHarness(t).
 			WithChain(10, func(m *mockChainContainer) {
 				m.pruneDeniedResult = map[uint64][]common.Hash{
@@ -2610,11 +2618,11 @@ func TestRewindAccepted(t *testing.T) {
 		require.NotNil(t, plan.TargetPayloads[chainID])
 		require.Equal(t, uint64(999), uint64(plan.TargetPayloads[chainID].ExecutionPayload.Timestamp))
 
-		err = h.interop.applyRewindPlan(plan)
-		require.NoError(t, err)
-		require.True(t, trackingDB.clearCalled > 0, "logsDB should be cleared when rewinding to empty")
-		require.Equal(t, []uint64{999}, mock.rewindEngineCalls)
-		require.Same(t, plan.TargetPayloads[chainID], mock.lastRewindEngineTarget)
+		// The plan has no TargetHeads (rewind target predates the first verified
+		// entry), so applying it must halt before deleting anything.
+		require.Panics(t, func() { _ = h.interop.applyRewindPlan(plan) })
+		require.Equal(t, 0, trackingDB.clearCalled, "logsDB must not be cleared")
+		require.Empty(t, mock.rewindEngineCalls, "engines must not be rewound")
 	})
 }
 

@@ -1022,6 +1022,26 @@ func (i *Interop) shouldResetEnginesOnRewind(timestamp uint64) (bool, error) {
 }
 
 func (i *Interop) applyRewindPlan(plan RewindPlan) error {
+	// A plan without TargetHeads means the rewind target predates the first
+	// verifiedDB entry, so there is no verified frontier to restore the logsDBs
+	// to. Applying it would clear the verifiedDB and wipe every logsDB —
+	// including backfilled blocks from before the verification start point that
+	// can never be re-inserted, since backfill only runs on cold start. Without
+	// them, cross-validation would wrongly reject valid executing messages whose
+	// initiating messages lived in the deleted range. Halt loudly instead of
+	// silently destroying the databases; recovery requires an operator to remove
+	// the interop data directory so a fresh cold start re-runs the backfill.
+	if plan.TargetHeads == nil {
+		first, hasFirst := i.verifiedDB.FirstTimestamp()
+		panic(fmt.Sprintf(
+			"interop: rewind at/after timestamp %d has no verified predecessor in the verifiedDB "+
+				"(first verified timestamp=%d, verifiedDB non-empty=%t); refusing to apply it because "+
+				"that would clear the verifiedDB and all logsDBs, irrecoverably deleting backfilled "+
+				"log history needed to verify executing messages; to recover, remove the interop data "+
+				"directory and restart so cold-start backfill reseeds the databases",
+			plan.RewindAtOrAfter, first, hasFirst))
+	}
+
 	i.log.Warn("rewinding accepted state due to drift", "timestamp", plan.RewindAtOrAfter)
 
 	if _, err := i.verifiedDB.Rewind(plan.RewindAtOrAfter); err != nil {
@@ -1049,19 +1069,6 @@ func (i *Interop) applyRewindPlan(plan RewindPlan) error {
 			i.log.Error("failed to prune deny list on rewind", "chain", chainID, "err", err)
 			recordErr(fmt.Errorf("chain %s: prune deny list on rewind: %w", chainID, err))
 		}
-	}
-
-	if plan.TargetHeads == nil {
-		for chainID, db := range i.logsDBs {
-			if err := db.Clear(); err != nil {
-				i.log.Error("failed to clear logsDB on full rewind", "chain", chainID, "err", err)
-				recordErr(fmt.Errorf("chain %s: clear logsDB on full rewind: %w", chainID, err))
-			}
-		}
-		if len(allErrs) == 0 {
-			i.resetChainEnginesIfNeeded(plan, sortedChainIDs, recordErr)
-		}
-		return errors.Join(allErrs...)
 	}
 
 	for chainID, db := range i.logsDBs {
