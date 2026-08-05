@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	coreinterop "github.com/ethereum-optimism/optimism/op-core/interop"
 	"github.com/ethereum-optimism/optimism/op-core/interop/depset"
 	opservice "github.com/ethereum-optimism/optimism/op-service"
 	"github.com/ethereum-optimism/optimism/op-service/clock"
@@ -1021,21 +1022,51 @@ func (i *Interop) shouldResetEnginesOnRewind(timestamp uint64) (bool, error) {
 	return false, nil
 }
 
+// checkLogsDBsClearable vets a full logsDB clear (a rewind plan with no
+// TargetHeads, i.e. a rewind past the entire verified history). Clearing is a
+// safe recovery when every logsDB block is at or after the first verified
+// timestamp: the verification loop restarts from verificationStartTimestamp
+// and re-seals everything the clear deleted. Blocks before the first verified
+// timestamp, however, were seeded by cold-start backfill and nothing
+// re-creates them mid-process — deleting them would make cross-validation
+// wrongly reject valid executing messages whose initiating messages live in
+// that range. Panic before anything is deleted rather than silently destroying
+// that history. Returns an error (retried next round) if a logsDB cannot be
+// inspected.
+func (i *Interop) checkLogsDBsClearable(rewindTS uint64) error {
+	first, hasFirst := i.verifiedDB.FirstTimestamp()
+	if !hasFirst {
+		// The verifiedDB is already empty. Fresh plans are only built against a
+		// non-empty verifiedDB, so this is a WAL replay of a rewind whose
+		// verifiedDB wipe already completed — the pre-crash pass vetted the clear.
+		return nil
+	}
+	for chainID, db := range i.logsDBs {
+		seal, err := db.FirstSealedBlock()
+		if errors.Is(err, coreinterop.ErrFuture) {
+			continue // empty logsDB, nothing to lose
+		}
+		if err != nil {
+			return fmt.Errorf("chain %s: read first sealed block while vetting full logsDB clear: %w", chainID, err)
+		}
+		if seal.Timestamp < first {
+			panic(fmt.Sprintf(
+				"interop: rewind at/after timestamp %d has no verified predecessor and requires clearing "+
+					"all logsDBs, but chain %s's logsDB starts at timestamp %d, before the first verified "+
+					"timestamp %d; clearing would irrecoverably delete backfilled log history needed to "+
+					"verify executing messages, so refusing to proceed; to recover, remove the interop "+
+					"data directory and restart so cold-start backfill reseeds the databases",
+				rewindTS, chainID, seal.Timestamp, first))
+		}
+	}
+	return nil
+}
+
 func (i *Interop) applyRewindPlan(plan RewindPlan) error {
-	// A plan without TargetHeads means the rewind target predates the first
-	// verifiedDB entry. Applying it would clear the verifiedDB and every logsDB,
-	// deleting backfilled pre-verification blocks that only cold-start backfill
-	// can produce — after which cross-validation would wrongly reject executing
-	// messages referencing them. Halt loudly instead of silently destroying data.
 	if plan.TargetHeads == nil {
-		first, hasFirst := i.verifiedDB.FirstTimestamp()
-		panic(fmt.Sprintf(
-			"interop: rewind at/after timestamp %d has no verified predecessor in the verifiedDB "+
-				"(first verified timestamp=%d, verifiedDB non-empty=%t); refusing to apply it because "+
-				"that would clear the verifiedDB and all logsDBs, irrecoverably deleting backfilled "+
-				"log history needed to verify executing messages; to recover, remove the interop data "+
-				"directory and restart so cold-start backfill reseeds the databases",
-			plan.RewindAtOrAfter, first, hasFirst))
+		if err := i.checkLogsDBsClearable(plan.RewindAtOrAfter); err != nil {
+			return err
+		}
 	}
 
 	i.log.Warn("rewinding accepted state due to drift", "timestamp", plan.RewindAtOrAfter)
@@ -1065,6 +1096,19 @@ func (i *Interop) applyRewindPlan(plan RewindPlan) error {
 			i.log.Error("failed to prune deny list on rewind", "chain", chainID, "err", err)
 			recordErr(fmt.Errorf("chain %s: prune deny list on rewind: %w", chainID, err))
 		}
+	}
+
+	if plan.TargetHeads == nil {
+		for chainID, db := range i.logsDBs {
+			if err := db.Clear(); err != nil {
+				i.log.Error("failed to clear logsDB on full rewind", "chain", chainID, "err", err)
+				recordErr(fmt.Errorf("chain %s: clear logsDB on full rewind: %w", chainID, err))
+			}
+		}
+		if len(allErrs) == 0 {
+			i.resetChainEnginesIfNeeded(plan, sortedChainIDs, recordErr)
+		}
+		return errors.Join(allErrs...)
 	}
 
 	for chainID, db := range i.logsDBs {

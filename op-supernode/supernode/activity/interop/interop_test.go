@@ -2548,7 +2548,7 @@ func TestRewindAccepted(t *testing.T) {
 		require.Nil(t, plan.ResetAllChainsTo)
 	})
 
-	t.Run("panics instead of clearing logsDB when rewinding to empty", func(t *testing.T) {
+	t.Run("clears logsDB when rewinding to empty and all blocks are regenerable", func(t *testing.T) {
 		h := newInteropTestHarness(t).
 			WithChain(10, nil).
 			Build()
@@ -2563,22 +2563,58 @@ func TestRewindAccepted(t *testing.T) {
 		})
 		require.NoError(t, err)
 
+		// logsDB starts at the first verified timestamp: no backfilled
+		// pre-frontier history, so a full clear is safe — the verification
+		// loop re-seals everything from verificationStartTimestamp.
 		trackingDB := &mockLogsDBWithState{
 			latestBlock: eth.BlockID{Number: 100},
 			hasBlocks:   true,
+			firstSealed: messages.BlockSeal{Number: 100, Timestamp: 1000},
 		}
 		h.interop.logsDBs[chainID] = trackingDB
 
-		// Rewinding the only entry would empty the verifiedDB and clear the
-		// logsDBs, deleting backfilled history that cannot be regenerated.
+		// Rewind the only entry — verifiedDB becomes empty
+		plan, err := h.interop.buildRewindPlan(1000)
+		require.NoError(t, err)
+		err = h.interop.applyRewindPlan(plan)
+		require.NoError(t, err)
+
+		// logsDB should be cleared (no previous frontier to rewind to)
+		require.True(t, trackingDB.clearCalled > 0, "logsDB should be cleared when rewinding to empty")
+	})
+
+	t.Run("panics instead of clearing logsDB holding backfilled history", func(t *testing.T) {
+		h := newInteropTestHarness(t).
+			WithChain(10, nil).
+			Build()
+
+		chainID := h.Mock(10).id
+
+		err := h.commitVerified(VerifiedResult{
+			Timestamp:   1000,
+			L1Inclusion: eth.BlockID{Number: 50},
+			L2Heads:     map[eth.ChainID]eth.BlockID{chainID: {Number: 100}},
+		})
+		require.NoError(t, err)
+
+		// logsDB starts before the first verified timestamp: those blocks were
+		// seeded by cold-start backfill and cannot be regenerated, so a full
+		// clear must be refused.
+		trackingDB := &mockLogsDBWithState{
+			latestBlock: eth.BlockID{Number: 100},
+			hasBlocks:   true,
+			firstSealed: messages.BlockSeal{Number: 40, Timestamp: 880},
+		}
+		h.interop.logsDBs[chainID] = trackingDB
+
 		plan, err := h.interop.buildRewindPlan(1000)
 		require.NoError(t, err)
 		require.PanicsWithValue(t,
-			"interop: rewind at/after timestamp 1000 has no verified predecessor in the verifiedDB "+
-				"(first verified timestamp=1000, verifiedDB non-empty=true); refusing to apply it because "+
-				"that would clear the verifiedDB and all logsDBs, irrecoverably deleting backfilled "+
-				"log history needed to verify executing messages; to recover, remove the interop data "+
-				"directory and restart so cold-start backfill reseeds the databases",
+			"interop: rewind at/after timestamp 1000 has no verified predecessor and requires clearing "+
+				"all logsDBs, but chain 10's logsDB starts at timestamp 880, before the first verified "+
+				"timestamp 1000; clearing would irrecoverably delete backfilled log history needed to "+
+				"verify executing messages, so refusing to proceed; to recover, remove the interop "+
+				"data directory and restart so cold-start backfill reseeds the databases",
 			func() { _ = h.interop.applyRewindPlan(plan) })
 
 		// Nothing was deleted: logsDB untouched, verifiedDB entry preserved.
@@ -2587,7 +2623,7 @@ func TestRewindAccepted(t *testing.T) {
 		require.True(t, has, "verifiedDB entry must be preserved")
 	})
 
-	t.Run("full rewind captures reset payloads but panics before clearing", func(t *testing.T) {
+	t.Run("full rewind captures reset payloads before clearing verified frontier", func(t *testing.T) {
 		h := newInteropTestHarness(t).
 			WithChain(10, func(m *mockChainContainer) {
 				m.pruneDeniedResult = map[uint64][]common.Hash{
@@ -2608,6 +2644,7 @@ func TestRewindAccepted(t *testing.T) {
 		trackingDB := &mockLogsDBWithState{
 			latestBlock: eth.BlockID{Number: 1000},
 			hasBlocks:   true,
+			firstSealed: messages.BlockSeal{Number: 1000, Timestamp: 1000},
 		}
 		h.interop.logsDBs[chainID] = trackingDB
 
@@ -2618,11 +2655,11 @@ func TestRewindAccepted(t *testing.T) {
 		require.NotNil(t, plan.TargetPayloads[chainID])
 		require.Equal(t, uint64(999), uint64(plan.TargetPayloads[chainID].ExecutionPayload.Timestamp))
 
-		// The plan has no TargetHeads (rewind target predates the first verified
-		// entry), so applying it must halt before deleting anything.
-		require.Panics(t, func() { _ = h.interop.applyRewindPlan(plan) })
-		require.Equal(t, 0, trackingDB.clearCalled, "logsDB must not be cleared")
-		require.Empty(t, mock.rewindEngineCalls, "engines must not be rewound")
+		err = h.interop.applyRewindPlan(plan)
+		require.NoError(t, err)
+		require.True(t, trackingDB.clearCalled > 0, "logsDB should be cleared when rewinding to empty")
+		require.Equal(t, []uint64{999}, mock.rewindEngineCalls)
+		require.Same(t, plan.TargetPayloads[chainID], mock.lastRewindEngineTarget)
 	})
 }
 
@@ -2634,6 +2671,7 @@ func TestRewindAccepted(t *testing.T) {
 type mockLogsDBWithState struct {
 	latestBlock  eth.BlockID
 	hasBlocks    bool
+	firstSealed  messages.BlockSeal
 	rewindCalled bool
 	clearCalled  int
 }
@@ -2642,7 +2680,7 @@ func (m *mockLogsDBWithState) LatestSealedBlock() (eth.BlockID, bool) {
 	return m.latestBlock, m.hasBlocks
 }
 func (m *mockLogsDBWithState) FirstSealedBlock() (messages.BlockSeal, error) {
-	return messages.BlockSeal{}, nil
+	return m.firstSealed, nil
 }
 func (m *mockLogsDBWithState) FindSealedBlock(number uint64) (messages.BlockSeal, error) {
 	return messages.BlockSeal{}, nil
