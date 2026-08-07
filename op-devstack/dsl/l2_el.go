@@ -695,59 +695,42 @@ func (el *L2ELNode) AssertTxInBlock(blockNumber uint64, txHash common.Hash) {
 	el.log.Info("confirmed transaction in block", "blockNumber", blockNumber, "txHash", txHash)
 }
 
-// TxInBlockFn returns a check that the canonical block at blockNumber contains a transaction
-// with the given hash, re-reading the block until it does. A by-number read resolves against
-// the canonical head chain, and on a node whose canonical head can transiently flip between
-// branches — e.g. a light follow-CL whose sequencer seals an in-flight block on a stale parent
-// right after a follow-source reorg — a single read races the flip even when blockNumber is
-// at/below the safe label. Polls every 2s.
-func (el *L2ELNode) TxInBlockFn(blockNumber uint64, txHash common.Hash, attempts int) CheckFunc {
-	return func() error {
-		return retry.Do0(el.ctx, attempts, &retry.FixedStrategy{Dur: 2 * time.Second}, func() error {
-			found, err := el.blockContainsTx(blockNumber, txHash)
-			if err != nil {
-				el.log.Warn("block read failed; will retry", "blockNumber", blockNumber, "err", err)
-				return err
-			}
-			if !found {
-				return fmt.Errorf("tx %s not in canonical block %d", txHash, blockNumber)
-			}
-			el.log.Info("confirmed transaction in block", "blockNumber", blockNumber, "txHash", txHash)
-			return nil
-		})
-	}
-}
-
 // AwaitTxInBlock waits until the canonical block at blockNumber contains a transaction with
-// the given hash. See TxInBlockFn for why a single read is not always enough.
+// the given hash. A by-number read resolves against the canonical head chain, and on a node
+// whose canonical head can transiently flip between branches — e.g. a light follow-CL whose
+// sequencer seals an in-flight block on a stale parent right after a follow-source reorg —
+// a single read races the flip even when blockNumber is at/below the safe label. Polls every 2s.
 func (el *L2ELNode) AwaitTxInBlock(blockNumber uint64, txHash common.Hash, attempts int) {
-	el.require.NoError(el.TxInBlockFn(blockNumber, txHash, attempts)())
-}
-
-// TxNotInBlockFn returns a check that the canonical block at blockNumber does not contain a
-// transaction with the given hash, re-reading until a successful read shows it absent. See
-// TxInBlockFn for why a single by-number read is not always enough. Polls every 2s.
-func (el *L2ELNode) TxNotInBlockFn(blockNumber uint64, txHash common.Hash, attempts int) CheckFunc {
-	return func() error {
-		return retry.Do0(el.ctx, attempts, &retry.FixedStrategy{Dur: 2 * time.Second}, func() error {
-			found, err := el.blockContainsTx(blockNumber, txHash)
-			if err != nil {
-				el.log.Warn("block read failed; will retry", "blockNumber", blockNumber, "err", err)
-				return err
-			}
-			if found {
-				return fmt.Errorf("tx %s still in canonical block %d", txHash, blockNumber)
-			}
-			el.log.Info("confirmed transaction not in block", "blockNumber", blockNumber, "txHash", txHash)
-			return nil
-		})
-	}
+	el.require.NoError(retry.Do0(el.ctx, attempts, &retry.FixedStrategy{Dur: 2 * time.Second}, func() error {
+		found, err := el.blockContainsTx(blockNumber, txHash)
+		if err != nil {
+			el.log.Warn("block read failed; will retry", "blockNumber", blockNumber, "err", err)
+			return err
+		}
+		if !found {
+			return fmt.Errorf("tx %s not in canonical block %d", txHash, blockNumber)
+		}
+		el.log.Info("confirmed transaction in block", "blockNumber", blockNumber, "txHash", txHash)
+		return nil
+	}))
 }
 
 // AwaitTxNotInBlock waits until the canonical block at blockNumber does not contain a
-// transaction with the given hash. See TxNotInBlockFn.
+// transaction with the given hash, re-reading until a successful read shows it absent. See
+// AwaitTxInBlock for why a single by-number read is not always enough. Polls every 2s.
 func (el *L2ELNode) AwaitTxNotInBlock(blockNumber uint64, txHash common.Hash, attempts int) {
-	el.require.NoError(el.TxNotInBlockFn(blockNumber, txHash, attempts)())
+	el.require.NoError(retry.Do0(el.ctx, attempts, &retry.FixedStrategy{Dur: 2 * time.Second}, func() error {
+		found, err := el.blockContainsTx(blockNumber, txHash)
+		if err != nil {
+			el.log.Warn("block read failed; will retry", "blockNumber", blockNumber, "err", err)
+			return err
+		}
+		if found {
+			return fmt.Errorf("tx %s still in canonical block %d", txHash, blockNumber)
+		}
+		el.log.Info("confirmed transaction not in block", "blockNumber", blockNumber, "txHash", txHash)
+		return nil
+	}))
 }
 
 // ResendUntilSafe broadcasts a transaction from makeTx and waits for it to derive onto this
