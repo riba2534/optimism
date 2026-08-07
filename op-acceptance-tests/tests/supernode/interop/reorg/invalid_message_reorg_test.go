@@ -23,7 +23,7 @@ import (
 // recovers slowly — cross-safe advances roughly one block per two follow-source poll cycles
 // (#21119) — so the cross-safe waits carry the largest budgets.
 const (
-	// Retry attempts at the DSL's 2s poll interval.
+	// Retry attempts, spaced dsl.DefaultPollInterval apart.
 	canonicalReadSettleAttempts = 15
 	crossSafeMatchAttempts      = 30
 	crossSafeReachAttempts      = 45
