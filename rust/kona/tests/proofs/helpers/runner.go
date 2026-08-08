@@ -7,7 +7,6 @@ import (
 	"github.com/ethereum-optimism/optimism/op-service/eth"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/log"
-	"github.com/ethereum/go-ethereum/params"
 	"github.com/stretchr/testify/require"
 )
 
@@ -41,25 +40,14 @@ func WithPreInteropDefaults(t helpers.Testing, l2ClaimBlockNum uint64, l2 *helpe
 	}
 }
 
-// ProgramRunner runs a fault-proof program (or its SP1 equivalent) for one state transition against
-// the prepared chain inputs, returning ErrClaimNotValid when the claim is rejected.
-type ProgramRunner func(t helpers.Testing, workDir string, rollupCfgs []*rollup.Config, l1chainConfig *params.ChainConfig, l1Rpc string, l1BeaconRpc string, l2Rpcs []string, fixtureInputs FixtureInputs) error
-
 // RunFaultProofProgram runs the native fault proof program for the transition to the given L2 block number from the preceding one.
 func RunFaultProofProgram(t helpers.Testing, logger log.Logger, l1 *helpers.L1Miner, checkResult CheckResult, fixtureInputParams ...FixtureInputParam) {
-	runProgram(t, logger, l1, RunKonaNative, false, checkResult, fixtureInputParams...)
+	runProgram(t, logger, l1, checkResult, fixtureInputParams...)
 }
 
-// RunSP1RangeProgram runs the kona-sp1 range guest in SP1 execute mode for the transition to the
-// given L2 block number from the preceding one.
-func RunSP1RangeProgram(t helpers.Testing, logger log.Logger, l1 *helpers.L1Miner, checkResult CheckResult, fixtureInputParams ...FixtureInputParam) {
-	runProgram(t, logger, l1, RunRangeExecutor, true, checkResult, fixtureInputParams...)
-}
-
-// runProgram prepares the chain inputs (beacon, configs, L2 endpoints) for a single state
-// transition and dispatches them to the given program runner. allowSP1Options must be true only
-// for runners that honor SP1-only fixture options (currently the SP1 range executor).
-func runProgram(t helpers.Testing, logger log.Logger, l1 *helpers.L1Miner, run ProgramRunner, allowSP1Options bool, checkResult CheckResult, fixtureInputParams ...FixtureInputParam) {
+// runProgram prepares the chain inputs and runs the native fault-proof program for one state
+// transition.
+func runProgram(t helpers.Testing, logger log.Logger, l1 *helpers.L1Miner, checkResult CheckResult, fixtureInputParams ...FixtureInputParam) {
 	l1Head := l1.L1Chain().CurrentBlock()
 
 	fixtureInputs := &FixtureInputs{
@@ -69,10 +57,6 @@ func runProgram(t helpers.Testing, logger log.Logger, l1 *helpers.L1Miner, run P
 		apply(fixtureInputs)
 	}
 	require.Greater(t, len(fixtureInputs.L2Sources), 0, "Must specify at least one L2 source")
-	// SP1-only fixture options are ignored by the native fault-proof program, so passing them to
-	// RunFaultProofProgram is a mistake that would silently pass. Fail loudly.
-	require.False(t, (fixtureInputs.CorruptClaim || fixtureInputs.SP1NativeCore) && !allowSP1Options,
-		"SP1-only fixture options are only honored by RunSP1RangeProgram; the native fault-proof program ignores them")
 
 	// Run the program from the state transition from L2 block l2ClaimBlockNum - 1 -> l2ClaimBlockNum.
 	workDir := t.TempDir()
@@ -105,6 +89,6 @@ func runProgram(t helpers.Testing, logger log.Logger, l1 *helpers.L1Miner, run P
 		l2Endpoints = append(l2Endpoints, endpoint)
 	}
 
-	err := run(t, workDir, rollupCfgs, l1chainConfig, l1.HTTPEndpoint(), fakeBeacon.BeaconAddr(), l2Endpoints, *fixtureInputs)
+	err := RunKonaNative(t, workDir, rollupCfgs, l1chainConfig, l1.HTTPEndpoint(), fakeBeacon.BeaconAddr(), l2Endpoints, *fixtureInputs)
 	checkResult(t, err)
 }
