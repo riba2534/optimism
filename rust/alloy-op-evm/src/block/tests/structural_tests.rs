@@ -906,6 +906,7 @@ fn test_post_exec_tx_does_not_accrue_da_footprint() {
 /// end-to-end builder-vs-validator pin.
 mod warm_set_leak {
     use super::*;
+    use alloc::collections::BTreeSet;
 
     /// Sender of the failing tx `A` — loaded+warmed during validation before the nonce check
     /// rejects it. Its leaked warmth is the bug.
@@ -1135,6 +1136,123 @@ mod warm_set_leak {
         assert_eq!(
             without, with_failed_a,
             "with SDM disabled (prod config) a skipped failing tx must not affect the next tx",
+        );
+    }
+
+    // Leak B: unlike the journal-warmth leak above, this rides the producer *policy's* block-scoped
+    // state. `FixedRefundPolicy` is stateless, so it cannot detect it; use a policy whose only
+    // mutation is in `note_account_touch` — the `transact_raw` error-path call
+    // (`note_post_exec_account_touch`) a dropped tx triggers.
+    #[derive(Debug, Clone, Default)]
+    struct FeeVaultTouchPolicy {
+        touched: BTreeSet<Address>,
+    }
+
+    impl PostExecRefundInspector for FeeVaultTouchPolicy {
+        type Snapshot = BTreeSet<Address>;
+
+        fn begin_tx(&mut self, _ctx: PostExecTxContext) {}
+
+        fn note_account_touch(&mut self, address: Address) {
+            self.touched.insert(address);
+        }
+
+        fn finish_tx(&mut self) -> PostExecExecutedTx {
+            PostExecExecutedTx::default()
+        }
+
+        fn inspect_step<CTX>(&mut self, _interp: &mut Interpreter, _context: &mut CTX)
+        where
+            CTX: ContextTr<Journal: JournalExt>,
+        {
+        }
+
+        fn inspect_call<CTX>(&mut self, _context: &mut CTX, _inputs: &mut CallInputs)
+        where
+            CTX: ContextTr<Journal: JournalExt>,
+        {
+        }
+
+        fn inspect_call_end<CTX>(
+            &mut self,
+            _context: &mut CTX,
+            _inputs: &CallInputs,
+            _outcome: &CallOutcome,
+        ) where
+            CTX: ContextTr<Journal: JournalExt>,
+        {
+        }
+
+        fn inspect_create<CTX>(&mut self, _context: &mut CTX, _inputs: &mut CreateInputs)
+        where
+            CTX: ContextTr<Journal: JournalExt>,
+        {
+        }
+
+        fn inspect_create_end<CTX>(
+            &mut self,
+            _context: &mut CTX,
+            _inputs: &CreateInputs,
+            _outcome: &CreateOutcome,
+        ) where
+            CTX: ContextTr<Journal: JournalExt>,
+        {
+        }
+
+        fn inspect_selfdestruct(&mut self, _contract: Address, _target: Address, _value: U256) {}
+
+        fn snapshot(&self) -> Self::Snapshot {
+            self.touched.clone()
+        }
+
+        fn restore(&mut self, snapshot: Self::Snapshot) {
+            self.touched = snapshot;
+        }
+    }
+
+    /// A dropped state-invalid tx must leave no residue in a stateful producer policy. The
+    /// commit-condition wrapper snapshots in Produce mode and restores the policy on `Err`; delete
+    /// that restore (`execute_transaction_with_commit_condition`, `Err` branch) and this fails as
+    /// the dropped tx's fee-vault touches persist.
+    fn assert_dropped_tx_leaves_no_policy_touch(
+        make_db: impl Fn() -> State<InMemoryDB>,
+        a_error_context: &str,
+    ) {
+        let mut db = make_db();
+        let receipt_builder = OpAlloyReceiptBuilder::default();
+        let op_chain_hardforks = hardforks();
+        let mut executor = build_policy_executor_with::<FeeVaultTouchPolicy>(
+            &mut db,
+            &receipt_builder,
+            &op_chain_hardforks,
+            0,
+            Address::ZERO,
+            Inspect::Disabled,
+        );
+
+        assert!(executor.refund_snapshot().is_empty());
+        executor
+            .execute_transaction(&legacy_with_sender(LEAK_ADDR, 0, PROBE_SENDER, 50_000))
+            .expect_err(a_error_context);
+        assert!(
+            executor.refund_snapshot().is_empty(),
+            "a dropped failing tx left fee-vault touches in the producer policy",
+        );
+    }
+
+    #[test]
+    fn dropped_nonce_too_low_tx_leaves_no_fee_vault_touch_in_policy() {
+        assert_dropped_tx_leaves_no_policy_touch(
+            nonce_too_low_db,
+            "tx A must fail NonceTooLow and be skipped",
+        );
+    }
+
+    #[test]
+    fn dropped_eip3607_tx_leaves_no_fee_vault_touch_in_policy() {
+        assert_dropped_tx_leaves_no_policy_touch(
+            contract_sender_db,
+            "tx A must fail EIP-3607 (contract sender) and be skipped",
         );
     }
 }

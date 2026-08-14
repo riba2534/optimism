@@ -854,6 +854,9 @@ where
         Ok(Some(self.commit_transaction(output)))
     }
 
+    // Does not snapshot/restore producer-policy state: in Produce mode a failing tx still records
+    // its fee-vault touches (`transact_raw` error path), so a fallible tx must go through
+    // `execute_transaction_with_commit_condition`, which rolls that back on `Err`.
     fn execute_transaction_without_commit(
         &mut self,
         tx: impl ExecutableTx<Self>,
