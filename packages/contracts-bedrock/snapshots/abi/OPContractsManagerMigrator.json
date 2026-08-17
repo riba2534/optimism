@@ -196,6 +196,16 @@
   },
   {
     "inputs": [],
+    "name": "OPContractsManagerMigrator_InvalidAbsolutePrestate",
+    "type": "error"
+  },
+  {
+    "inputs": [],
+    "name": "OPContractsManagerMigrator_InvalidInitBond",
+    "type": "error"
+  },
+  {
+    "inputs": [],
     "name": "OPContractsManagerMigrator_InvalidStartingRespectedGameType",
     "type": "error"
   },
